@@ -1,4 +1,4 @@
-# 📘 SLCM Attendance Automation (Excel → Python Selenium)
+# 📘 SLCM Attendance Automation (Windows)
 
 Automates marking **student attendance** on **SLCM (Salesforce Lightning)** using **Python + Selenium**, launched directly from **Excel VBA** on Windows.
 
