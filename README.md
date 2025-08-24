@@ -15,19 +15,7 @@ This project automates marking **student attendance** on **SLCM (Salesforce Ligh
 
 ---
 
-## 📂 Project Structure
 
-```
-slcm-attendance/
-├─ maa.py                  # Python Selenium automation script
-├─ excel/
-│  └─ RunAttendance.bas    # VBA macro module (Windows)
-├─ README.md               # This file
-├─ .gitignore
-└─ (optional) workbook.xlsm
-```
-
----
 
 ## 🖥️ Requirements
 
