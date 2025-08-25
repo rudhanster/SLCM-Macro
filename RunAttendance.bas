@@ -219,6 +219,7 @@ Private Function GetAbsenteesForDate(ByVal selectedDate As String) As String
     Dim headerRow As Long
     Dim dateCol As Long, regNoCol As Long
     Dim lastRow As Long, r As Long
+    Dim c As Long
     Dim absentees As String
     Dim cellValue As String
     
@@ -330,4 +331,5 @@ Private Function CleanOneLine(ByVal s As String) As String
     s = Replace$(s, vbLf, " ")
     CleanOneLine = Trim$(s)
 End Function
+
 
