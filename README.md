@@ -30,7 +30,7 @@ Install in one line:
 ```bash
 pip install selenium pandas openpyxl webdriver-manager
 ```
-- Your Excel workbook with:
+###- Your Excel workbook with:
   - **Attendance** sheet:
     - Row 2 = headers; one column named like **Reg. No.**
     - Data starts from row 3; absentees marked `ab` or `ABSENT`
