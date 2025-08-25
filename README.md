@@ -76,6 +76,19 @@ pip install selenium pandas openpyxl webdriver-manager
 
 ---
 
+## 🔘 Add a Button in Excel
+1. Go to **File → Options → Customize Ribbon** → enable **Developer** tab.
+2. Developer → **Insert → Form Controls → Button**.
+3. Draw button on your sheet.
+4. Assign macro: choose `RunAttendanceForActiveWorkbook`.
+5. Right-click button → **Edit Text** → rename to "Run Attendance Automation".
+
+Now you can run with a single click.
+
+---
+
+
+
 ## 🔧 Customization
 - **Close console automatically**: in VBA change `cmd.exe /K` to `cmd.exe /C`.
 - **Headless** Chrome: in `maa.py`, uncomment `--headless=new` (recommended only after stabilizing).
