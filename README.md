@@ -15,7 +15,7 @@ Automates marking **student attendance** on **SLCM (Salesforce Lightning)** usin
 ## 🖥️ Requirements
 - Windows 10/11
 - Google Chrome (latest)
--
+
 ### Python
 - Install **Python 3.11+**.
 - **Windows**:
