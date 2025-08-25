@@ -15,10 +15,21 @@ Automates marking **student attendance** on **SLCM (Salesforce Lightning)** usin
 ## 🖥️ Requirements
 - Windows 10/11
 - Google Chrome (latest)
-- Python 3.10+ with packages:
+-
+### Python
+- Install **Python 3.11+**.
+- **Windows**:
+  - Open **Microsoft Store**, search for **Python**, install it.
+- Verify:
   ```bash
-  pip install pandas selenium webdriver-manager
+  python --version
   ```
+
+### Dependencies
+Install in one line:
+```bash
+pip install selenium pandas openpyxl webdriver-manager
+```
 - Your Excel workbook with:
   - **Attendance** sheet:
     - Row 2 = headers; one column named like **Reg. No.**
