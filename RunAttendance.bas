@@ -69,7 +69,7 @@ Private Function GetAbsenteesForDate(ByVal selectedDate As String) As String
     
     For i = 3 To lastRow
         cellValue = UCase(CStr(ws.Cells(i, dateCol).Value))
-        If cellValue = "AB" Or cellValue = "ABSENT" Then
+        If cellValue = "AB" Or cellValue = "A" Then
             Dim regNo As String
             regNo = CStr(ws.Cells(i, regNoCol).Value)
             ' Strip trailing ".0" or anything after a dot, if the column is numeric-formatted
@@ -90,3 +90,4 @@ Private Function GetAbsenteesForDate(ByVal selectedDate As String) As String
 ErrorHandler:
     GetAbsenteesForDate = "ERROR"
 End Function
+
