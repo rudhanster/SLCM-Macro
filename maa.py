@@ -450,7 +450,7 @@ def main():
     print(f"   Course Name   : {course_name or '(blank)'}")
     print(f"   Course Code   : {course_code or '(blank)'}")
     print(f"   Semester      : {semester or '(blank)'}")
-    print(f"   Class Section : {class_section or '(blank)'}  (supports 'B' or 'B-1')")
+    print(f"   Class Section : {class_section or '(blank)'}")
 
     missing = []
     if not course_code:   missing.append("Course Code")
