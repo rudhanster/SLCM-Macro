@@ -6,11 +6,15 @@ Private Const PYTHON_EXE As String = "C:\Path\To\Python\python.exe"
 Private Const PY_SCRIPT  As String = "C:\Path\To\maa.py"
 ' ==================================
 
+' Keep console open after Python exits so you can read logs
+Private Const KEEP_CONSOLE_OPEN As Boolean = True
+
 Public Sub RunAttendanceForActiveWorkbook()
     Dim theDate As String, wbPath As String
     Dim absenteesList As String, subjectDetails As String
     Dim cmd As String, args As String
     Dim preview As String
+    Dim shellCmd As String, full As String
     
     ' --- Read selected date (prefer m/d/yyyy so Python treats X/Y/Z as MM/DD/YYYY) ---
     theDate = GetSelectedDateString()
@@ -28,8 +32,8 @@ Public Sub RunAttendanceForActiveWorkbook()
     
     ' --- Gather absentees for that date ---
     absenteesList = GetAbsenteesForDate(theDate)
-    If absenteesList = "ERROR" Then
-        MsgBox "Could not find absentees for the selected date.", vbExclamation
+    If Left$(absenteesList, 2) = "E:" Then
+        MsgBox Mid$(absenteesList, 3), vbExclamation, "Attendance date detection"
         Exit Sub
     End If
     
@@ -49,7 +53,6 @@ Public Sub RunAttendanceForActiveWorkbook()
         preview = preview & "❌ Absentees (" & CountCsv(absenteesList) & "): " & absenteesList & vbCrLf
     End If
     preview = preview & vbCrLf & "Proceed to update SLCM attendance?"
-    
     If MsgBox(preview, vbQuestion + vbOKCancel, "Confirm") <> vbOK Then Exit Sub
     
     ' --- Build command line (properly quoted) ---
@@ -60,23 +63,24 @@ Public Sub RunAttendanceForActiveWorkbook()
         QuoteArg(subjectDetails) _
     ), " ")
     
-    cmd = QuoteArg(PYTHON_EXE) & " " & QuoteArg(PY_SCRIPT) & " " & args
+    full = QuoteArg(PYTHON_EXE) & " " & QuoteArg(PY_SCRIPT) & " " & args
+    cmd = "cmd.exe " & IIf(KEEP_CONSOLE_OPEN, "/K ", "/C ") & QuoteArg(full)
     
     ' --- Validate paths exist ---
     If Dir(PYTHON_EXE, vbNormal) = "" Then
-        MsgBox "Python not found at:" & vbCrLf & PYTHON_EXE & vbCrLf & vbCrLf & "Edit PYTHON_EXE at the top of the module.", vbCritical
+        MsgBox "Python not found at:" & vbCrLf & PYTHON_EXE & vbCrLf & vbCrLf & _
+               "Edit PYTHON_EXE at the top of the module.", vbCritical
         Exit Sub
     End If
     If Dir(PY_SCRIPT, vbNormal) = "" Then
-        MsgBox "Python script not found at:" & vbCrLf & PY_SCRIPT & vbCrLf & vbCrLf & "Edit PY_SCRIPT at the top of the module.", vbCritical
+        MsgBox "Python script not found at:" & vbCrLf & PY_SCRIPT & vbCrLf & vbCrLf & _
+               "Edit PY_SCRIPT at the top of the module.", vbCritical
         Exit Sub
     End If
     
     ' --- Launch in a visible console so you can complete SSO and see logs ---
-    ' /K keeps the window open; use /C to close after it finishes
-    Shell "cmd.exe /K " & cmd, vbNormalFocus
+    Shell cmd, vbNormalFocus
 End Sub
-
 
 ' ===== Helpers =====
 
@@ -103,10 +107,10 @@ Fallback:
     GetSelectedDateString = ""
 End Function
 
-' Quote a single argument for Windows command line (handles spaces & embedded quotes)
+' Quote a single argument for Windows command line (handles spaces & embedded quotes).
 Private Function QuoteArg(ByVal s As String) As String
     If Len(s) = 0 Then
-        QuoteArg = """" & """"  ' -> ""
+        QuoteArg = """" & """"   ' -> ""
         Exit Function
     End If
     s = Replace$(s, """", """""") ' escape internal quotes
@@ -123,7 +127,6 @@ Private Function CountCsv(ByVal csv As String) As Long
         CountCsv = UBound(arr) - LBound(arr) + 1
     End If
 End Function
-
 
 ' -------- Robust header detection & date matching --------
 
@@ -209,17 +212,41 @@ Private Function FindDateColumn(ws As Worksheet, headerRow As Long, selectedDate
     Next c
 End Function
 
+' --- Manual fallback to pick the date column when auto-detect fails ---
+Private Function PromptForDateColumn(ws As Worksheet, headerRow As Long) As Long
+    Dim resp As String, col As Long
+    resp = InputBox("Auto-detection failed." & vbCrLf & _
+                    "Enter the DATE COLUMN LETTER (e.g., G):", _
+                    "Pick date column")
+    If Len(resp) = 0 Then
+        PromptForDateColumn = 0
+    Else
+        On Error Resume Next
+        col = Columns(UCase$(Trim$(resp))).Column
+        On Error GoTo 0
+        If col <= 0 Then
+            MsgBox "Invalid column letter.", vbExclamation
+            PromptForDateColumn = 0
+        ElseIf Len(Trim$(CStr(ws.Cells(headerRow, col).Value))) = 0 Then
+            MsgBox "That column's header is empty. Try again.", vbExclamation
+            PromptForDateColumn = 0
+        Else
+            PromptForDateColumn = col
+        End If
+    End If
+End Function
+
+' -------- Main sheet reader --------
 
 ' Reads absentees for the selected date from the "Attendance" sheet.
-' Works with your layout: headers on row 2; dates start at F2 onward; data from row 3.
+' Returns CSV of Reg. No. values, or "E: reason" on error.
 Private Function GetAbsenteesForDate(ByVal selectedDate As String) As String
     On Error GoTo ErrorHandler
     
     Dim ws As Worksheet
     Dim headerRow As Long
     Dim dateCol As Long, regNoCol As Long
-    Dim lastRow As Long, r As Long
-    Dim c As Long
+    Dim lastRow As Long, r As Long, c As Long
     Dim absentees As String
     Dim cellValue As String
     
@@ -229,7 +256,7 @@ Private Function GetAbsenteesForDate(ByVal selectedDate As String) As String
     On Error GoTo ErrorHandler
     
     If ws Is Nothing Then
-        GetAbsenteesForDate = "ERROR"
+        GetAbsenteesForDate = "E: Sheet 'Attendance' not found."
         Exit Function
     End If
     
@@ -240,18 +267,21 @@ Private Function GetAbsenteesForDate(ByVal selectedDate As String) As String
     ' Robust date column detection on headerRow
     dateCol = FindDateColumn(ws, headerRow, selectedDate)
     If dateCol = 0 Then
-        Dim lastHeaderCol As Long, c As Long, hdr As String, sample As String
+        Dim sample As String, lastHeaderCol As Long
         lastHeaderCol = ws.Cells(headerRow, ws.Columns.Count).End(xlToLeft).Column
-        sample = ""
-        For c = 1 To Application.Min(lastHeaderCol, 20)
-            hdr = NormalizeHeaderText(CStr(ws.Cells(headerRow, c).Value))
-            If Len(sample) < 700 Then sample = sample & "[" & c & "] " & hdr & vbCrLf
-        Next
-        MsgBox "Could not find date column matching: " & selectedDate & vbCrLf & _
-               "(Header row detected as row " & headerRow & ")." & vbCrLf & vbCrLf & _
-               "First headers scanned:" & vbCrLf & sample, vbExclamation
-        GetAbsenteesForDate = "ERROR"
-        Exit Function
+        sample = BuildHeaderSample(ws, headerRow, Application.Min(lastHeaderCol, 20))
+        
+        ' Offer manual selection
+        Dim manualCol As Long
+        manualCol = PromptForDateColumn(ws, headerRow)
+        If manualCol > 0 Then
+            dateCol = manualCol
+        Else
+            GetAbsenteesForDate = "E: Could not find a date column matching '" & selectedDate & _
+                                  "' (header row " & headerRow & ")." & vbCrLf & _
+                                  "First headers scanned:" & vbCrLf & sample
+            Exit Function
+        End If
     End If
     
     ' Find "Reg. No." column on same header row
@@ -264,8 +294,7 @@ Private Function GetAbsenteesForDate(ByVal selectedDate As String) As String
         End If
     Next c
     If regNoCol = 0 Then
-        MsgBox "Could not find 'Reg. No.' in header row " & headerRow & ".", vbExclamation
-        GetAbsenteesForDate = "ERROR"
+        GetAbsenteesForDate = "E: Could not find 'Reg. No.' column on header row " & headerRow & "."
         Exit Function
     End If
     
@@ -277,7 +306,7 @@ Private Function GetAbsenteesForDate(ByVal selectedDate As String) As String
         If cellValue = "AB" Or cellValue = "ABSENT" Then
             Dim regNo As String
             regNo = CStr(ws.Cells(r, regNoCol).Value)
-            regNo = Split(regNo, ".")(0)
+            regNo = Split(regNo, ".")(0)  ' strip ".0" if numeric-formatted
             regNo = Trim$(regNo)
             If Len(regNo) > 0 Then
                 If Len(absentees) > 0 Then absentees = absentees & ","
@@ -290,9 +319,16 @@ Private Function GetAbsenteesForDate(ByVal selectedDate As String) As String
     Exit Function
 
 ErrorHandler:
-    GetAbsenteesForDate = "ERROR"
+    GetAbsenteesForDate = "E: " & Err.Number & " - " & Err.Description
 End Function
 
+Private Function BuildHeaderSample(ws As Worksheet, headerRow As Long, howMany As Long) As String
+    Dim c As Long, s As String
+    For c = 1 To howMany
+        s = s & "[" & c & "] " & NormalizeHeaderText(CStr(ws.Cells(headerRow, c).Value)) & vbCrLf
+    Next
+    BuildHeaderSample = s
+End Function
 
 ' Reads subject details from "Initial Setup" sheet: B1..B5
 Private Function GetSubjectDetails() As String
@@ -331,5 +367,4 @@ Private Function CleanOneLine(ByVal s As String) As String
     s = Replace$(s, vbLf, " ")
     CleanOneLine = Trim$(s)
 End Function
-
 
