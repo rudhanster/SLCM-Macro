@@ -101,7 +101,7 @@ Public Sub RunAttendanceForActiveWorkbook()
     Set sh = CreateObject("WScript.Shell")
     sh.Run runLine, 1, False ' 1 = Normal window, False = Don't wait
     
-    MsgBox "SLCM Automation launched. Check the command window for progress.", vbInformation
+
 End Sub
 
 ' ==============================================================
@@ -236,4 +236,5 @@ Private Function GetSubjectDetails() As String
     GetSubjectDetails = courseName & DETAILS_DELIM & courseCode & DETAILS_DELIM & _
                         semester & DETAILS_DELIM & classSection & DETAILS_DELIM & sessionNo
 End Function
+
 
