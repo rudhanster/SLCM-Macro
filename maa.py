@@ -18,7 +18,6 @@ from selenium.common.exceptions import (
     TimeoutException,
     SessionNotCreatedException,
 )
-import re
 
 # -------- Tunables (you can tweak if needed) --------
 PANEL_READY_TIMEOUT    = 30     # seconds to wait for day panel to appear
@@ -28,10 +27,10 @@ SCROLL_STEP_FRACTION   = 0.60   # each calendar scroll moves ~60% of visible hei
 SCROLL_PAUSE           = 0.30   # pause between calendar scrolls
 AFTER_DATE_CLICK_PAUSE = 1.5    # time for panel to re-render after date click
 
-# NEW: Attendance table search limits so it never hangs
+# Attendance table search limits so it never hangs
 SHORT_FIND_TIMEOUT        = 2   # (s) small waits for elements during search
-PER_STUDENT_MAX_SECONDS   = 5  # (s) hard cap per student search
-TABLE_SCROLL_TRIES        = 6   # how many small scroll steps in the table
+PER_STUDENT_MAX_SECONDS   = 5   # (s) hard cap per student search
+TABLE_SCROLL_TRIES        = 6   # small scroll steps
 TABLE_SCROLL_PAUSE        = 0.25
 
 # =========================================================
@@ -45,13 +44,11 @@ LOGIN_URL = "https://maheslcm.manipal.edu/login"
 # CLI parsing (date, workbook path, absentees, subject details)
 #   python maa.py <date> <workbook_path> <absentees> <subject_details>
 #   <absentees>        -> comma-separated IDs (e.g., "2301,2302")
-#   <subject_details>  -> "CourseName|CourseCode|Semester|ClassSection[|Session]"
-#                         Session is optional and ignored if ClassSection is like "B-1".
+#   <subject_details>  -> "CourseName::CourseCode::Semester::ClassSection::SessionNo"
 # =========================================================
 def parse_arguments():
     if len(sys.argv) < 5:
         print("❌ Usage: python maa.py <date> <workbook_path> <absentees> <subject_details>")
-        print("   Example: python maa.py '8/1/2025' '/path/to/workbook.xlsx' '2301,2302' 'OS|CSE 3123|V|B-1'")
         sys.exit(1)
     selected_date_str   = sys.argv[1]
     workbook_path       = sys.argv[2]
@@ -149,6 +146,36 @@ def parse_date_any(s) -> date | None:
         return None
 
 # =========================================================
+# Subject details parsing (NO semester normalization)
+# =========================================================
+def parse_subject_details(details: str):
+    """
+    Accept "CourseName::CourseCode::Semester::ClassSection::SessionNo".
+    SessionNo may be blank.
+    Semester is preserved as-is (e.g., 'V' stays 'V').
+    """
+    raw = unicodedata.normalize("NFC", str(details or "")).strip()
+    if not raw:
+        return None, "empty subject details"
+    if "::" in raw:
+        parts = raw.split("::")
+    else:
+        # backwards-compat with old pipes if ever used
+        parts = raw.replace("^|", "|").split("|")
+    parts += [""] * (5 - len(parts))
+    course_name, course_code, semester, class_section, session_no = [p.strip() for p in parts[:5]]
+
+    # required checks
+    missing = []
+    if not course_code:   missing.append("Course Code")
+    if not semester:      missing.append("Semester")
+    if not class_section: missing.append("Class Section")
+    if missing:
+        return None, f"missing required fields: {', '.join(missing)} (raw={raw!r})"
+
+    return (course_name, course_code, semester, class_section, session_no), None
+
+# =========================================================
 # Selenium helpers
 # =========================================================
 def js_click(driver, el):
@@ -214,13 +241,8 @@ def click_calendar_date_fast(driver, day_number: str):
 def _norm(s: str) -> str:
     return " ".join((s or "").split())
 
-
-
 def _has_word(haystack: str, needle: str) -> bool:
-    # word boundary search on A-Z0-9 underscores; tweak if needed
     return re.search(rf'\b{re.escape(needle)}\b', haystack) is not None
-
-
 
 def matches_event_text(txt: str, code: str, sem: str, sec: str, sess: str | None) -> bool:
     """
@@ -246,11 +268,8 @@ def matches_event_text(txt: str, code: str, sem: str, sec: str, sess: str | None
             ok = ok and re.search(pat, T) is not None
         else:
             # letter section like B — must NOT match B-1/B-2
-            # 1) explicit "SEC B" or "SECTION B"
             pat1 = rf'\bSEC(?:TION)?\s*[:\-]?\s*{re.escape(secU)}(?!\s*-\s*\d+)\b'
-            # 2) parenthesized "(B)"
             pat2 = rf'\(\s*{re.escape(secU)}\s*\)'
-            # 3) standalone token …B… not followed by "-<digits>"
             pat3 = rf'(?<![A-Z0-9]){re.escape(secU)}(?!\s*-\s*\d+)(?![A-Z0-9])'
 
             ok = ok and (
@@ -265,7 +284,6 @@ def matches_event_text(txt: str, code: str, sem: str, sec: str, sess: str | None
         ok = ok and (f"SESSION {s}" in T)
 
     return ok
-
 
 # ---------- Day panel helpers ----------
 def day_header_strings(d: date):
@@ -433,15 +451,12 @@ def main():
 
     absentees = [s.strip() for s in (absentees_str or "").split(",") if s.strip()]
 
-    parts = subject_details_str.split("|")
-    if len(parts) < 4:
-        print(f"❌ Invalid subject details: {subject_details_str}")
+    parsed, err = parse_subject_details(subject_details_str)
+    if err:
+        print(f"❌ Invalid subject details: {err}")
+        print(f"   Received: {subject_details_str!r}")
         sys.exit(1)
-    course_name   = parts[0].strip()
-    course_code   = parts[1].strip()
-    semester      = parts[2].strip()
-    class_section = parts[3].strip()
-    session_no    = parts[4].strip() if len(parts) > 4 else ""  # optional
+    course_name, course_code, semester, class_section, session_no = parsed
 
     print(f"📅 Selected Date : {selected_date}")
     print(f"📂 Workbook      : {workbook_path}")
@@ -449,17 +464,9 @@ def main():
     print("\n📘 Course Details")
     print(f"   Course Name   : {course_name or '(blank)'}")
     print(f"   Course Code   : {course_code or '(blank)'}")
-    print(f"   Semester      : {semester or '(blank)'}")
+    print(f"   Semester      : {semester or '(blank)'}")   # NOTE: kept as-is (no V->5)
     print(f"   Class Section : {class_section or '(blank)'}")
-
-    missing = []
-    if not course_code:   missing.append("Course Code")
-    if not semester:      missing.append("Semester")
-    if not class_section: missing.append("Class Section")
-    if missing:
-        print("❌ Missing required subject details:")
-        for m in missing: print(f"   - {m}")
-        sys.exit(1)
+    print(f"   Session No    : {session_no or '(none)'}")
 
     # ---- Selenium profile ----
     from pathlib import Path
@@ -489,7 +496,19 @@ def main():
         opts.add_argument(f"--user-data-dir={user_data_dir}")
         opts.add_argument("--no-first-run")
         opts.add_argument("--no-default-browser-check")
-        # opts.add_argument("--headless=new")
+        
+        # Suppress log messages
+        opts.add_argument("--log-level=3")  # Only show fatal errors
+        opts.add_argument("--disable-logging")
+        opts.add_argument("--disable-dev-shm-usage")
+        opts.add_argument("--no-sandbox")  # May help with some warnings
+        
+        # Disable unnecessary features that generate logs
+        opts.add_argument("--disable-background-timer-throttling")
+        opts.add_argument("--disable-backgrounding-occluded-windows")
+        opts.add_argument("--disable-renderer-backgrounding")
+        opts.add_argument("--disable-features=TranslateUI,VizDisplayCompositor")
+        
         return opts
 
     def start_driver_with_fallback():
@@ -604,30 +623,23 @@ def main():
             input()
 
         # =============================
-        # Process absentees (UNTICK boxes) — never hang per student
+        # Process absentees (UNTICK boxes) — bounded time per student
         # =============================
         print(f"🔎 Processing attendance for {len(absentees)} absentees…")
         unticked_ids, not_found = [], []
 
-        # helper: get the scrollable table container (if any)
         def get_table_container():
             try:
                 return WebDriverWait(driver, 4).until(
                     EC.presence_of_element_located((By.XPATH, "//div[contains(@class,'slds-table') or contains(@class,'slds-scrollable')]//table/ancestor::div[contains(@class,'scroll') or contains(@class,'slds-scrollable')][1]"))
                 )
             except Exception:
-                # fallback to any scrollable table region
                 try:
                     return driver.find_element(By.XPATH, "//div[contains(@class,'slds-scrollable')]")
                 except Exception:
                     return None
 
         def try_find_cell_for_id(student_id):
-            """
-            Fast, bounded attempts to locate the student's id cell.
-            Returns WebElement (cell) or None.
-            """
-            # 1) Direct XPath: exact formatted text
             xps = [
                 f"//lightning-base-formatted-text[normalize-space()='{student_id}']",
                 f"//td[normalize-space()='{student_id}']",
@@ -643,14 +655,10 @@ def main():
                 except StaleElementReferenceException:
                     continue
 
-            # 2) JS scan as fallback (quicker than long waits)
             try:
                 cell = driver.execute_script("""
                     const sid = arguments[0].trim();
-                    const exact = (t) => (t||'').trim() === sid;
-                    const nodes = Array.from(document.querySelectorAll(
-                       "lightning-base-formatted-text, td, span"
-                    ));
+                    const nodes = Array.from(document.querySelectorAll("lightning-base-formatted-text, td, span"));
                     for (const n of nodes) {
                       const txt = (n.innerText || n.textContent || "").trim();
                       if (txt === sid) return n;
@@ -686,24 +694,14 @@ def main():
                 pass
 
         def process_one_absentee(student_id):
-            """
-            Returns:
-              True  => unticked
-              False => already unticked
-              None  => not found (within time budget)
-            """
             t0 = time.time()
-            attempts = 0
             while time.time() - t0 < PER_STUDENT_MAX_SECONDS:
-                attempts += 1
                 try:
                     cell = try_find_cell_for_id(student_id)
                     if not cell:
-                        # Try to reveal more rows by small table scrolls
                         scroll_table_small_steps()
                         continue
 
-                    # found a cell, get checkbox
                     checkbox = find_checkbox_from_cell(cell)
                     if not checkbox:
                         scroll_table_small_steps()
@@ -715,14 +713,10 @@ def main():
                         return True
                     else:
                         return False
-
                 except (StaleElementReferenceException, TimeoutException):
                     continue
                 except Exception:
-                    # Avoid hard stops on weird row types; keep trying within time budget
                     continue
-
-            # out of time for this student
             return None
 
         for ab in absentees:
