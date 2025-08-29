@@ -6,12 +6,7 @@ Private Const PY_SCRIPT  As String = "C:\Mac\Home\Documents\win\maa.py"
 ' ==================================
 
 ' Delimiter used between subject fields (VBA ? Python)
-Private Const DETAILS_DELIM As String = "::"
-
-' Keep terminal window open after Python exits?
-'   True  = launch via `cmd.exe /K` so the console stays open
-'   False = launch Python directly (safer quoting; console closes when done)
-Private Const KEEP_TERMINAL_OPEN As Boolean = False
+Private Const DETAILS_DELIM As String = "|"
 
 ' ==============================================================
 ' == MAIN ENTRY ================================================
@@ -69,38 +64,64 @@ Public Sub RunAttendanceForActiveWorkbook()
         Exit Sub
     End If
 
-    ' --- Build arguments (quote EACH arg) ---
-    args = Join(Array( _
-        QuoteArg(theDate), _
-        QuoteArg(wbPath), _
-        QuoteArg(absenteesList), _
-        QuoteArg(subjectDetails) _
-    ), " ")
-
-    ' Two launchers:
-    '   - direct (best quoting; console closes)
-    '   - cmd /K wrapper (console stays open, but cmd.exe does extra parsing)
-    If KEEP_TERMINAL_OPEN Then
-        ' Keep terminal open
-        Dim inner As String
-        inner = QuoteArg(PYTHON_EXE) & " " & QuoteArg(PY_SCRIPT) & " " & args
-        ' wrap the entire python command for cmd.exe /K
-        runLine = "cmd.exe /K " & QuoteArg(inner)
-    Else
-        ' Direct, safest (recommended when you hit any argv quirks)
-        runLine = QuoteArg(PYTHON_EXE) & " " & QuoteArg(PY_SCRIPT) & " " & args
-    End If
-
-    Debug.Print runLine
+    ' --- Create a temporary batch file (most reliable approach) ---
+    Dim tempDir As String
+    Dim batFile As String
+    
+    tempDir = Environ("TEMP")
+    batFile = tempDir & "\slcm_automation_" & Format(Now, "yyyymmdd_hhnnss") & ".bat"
+    
+    ' Build batch file content
+    Dim batContent As String
+    batContent = "@echo off" & vbCrLf
+    batContent = batContent & "title SLCM Attendance Automation" & vbCrLf
+    batContent = batContent & "echo Starting SLCM Attendance Automation..." & vbCrLf
+    batContent = batContent & "echo." & vbCrLf
+    batContent = batContent & """" & PYTHON_EXE & """ """ & PY_SCRIPT & """ """ & theDate & """ """ & wbPath & """ """ & absenteesList & """ """ & subjectDetails & """" & vbCrLf
+    batContent = batContent & "echo." & vbCrLf
+    batContent = batContent & "echo Script execution completed." & vbCrLf
+    batContent = batContent & "echo Press any key to close this window..." & vbCrLf
+    batContent = batContent & "pause > nul" & vbCrLf
+    batContent = batContent & "del """ & batFile & """" & vbCrLf
+    
+    ' Write batch file
+    Dim fileNum As Integer
+    fileNum = FreeFile
+    Open batFile For Output As #fileNum
+    Print #fileNum, batContent
+    Close #fileNum
+    
+    ' Execute batch file
+    runLine = """" & batFile & """"
+    
+    Debug.Print "Executing: " & runLine
 
     ' --- Launch ---
     Dim sh As Object
     Set sh = CreateObject("WScript.Shell")
-    sh.Run runLine, 1, False
+    sh.Run runLine, 1, False ' 1 = Normal window, False = Don't wait
+    
+    MsgBox "SLCM Automation launched. Check the command window for progress.", vbInformation
 End Sub
 
 ' ==============================================================
-' == HELPERS ===================================================
+' == POWERSHELL HELPERS ========================================
+' ==============================================================
+
+' Properly quote strings for PowerShell
+Private Function PowerShellQuote(ByVal s As String) As String
+    ' Escape single quotes by doubling them, then wrap in single quotes
+    PowerShellQuote = "'" & Replace(s, "'", "''") & "'"
+End Function
+
+' Escape arguments for PowerShell ArgumentList (comma-separated)
+Private Function EscapeForPowerShell(ByVal s As String) As String
+    ' For ArgumentList, we need to quote each argument properly
+    EscapeForPowerShell = PowerShellQuote(s)
+End Function
+
+' ==============================================================
+' == ORIGINAL HELPERS ==========================================
 ' ==============================================================
 
 ' Returns selected cell as m/d/yyyy when it's a date; otherwise plain text
@@ -118,11 +139,6 @@ Private Function GetSelectedDateString() As String
     End If
 Fallback:
     GetSelectedDateString = ""
-End Function
-
-' Quote one argument (handles spaces and embedded quotes)
-Private Function QuoteArg(ByVal s As String) As String
-    QuoteArg = """" & Replace$(s, """", """""") & """"
 End Function
 
 ' Count CSV elements
@@ -159,13 +175,15 @@ Private Function GetAbsenteesForDate(ByVal selectedDate As String) As String
         GetAbsenteesForDate = "E: Could not find 'Reg. No.' column.": Exit Function
     End If
 
-    Dim lastRow As Long: lastRow = ws.Cells(ws.Rows.Count, regNoCol).End(xlUp).row
+    Dim lastRow As Long: lastRow = ws.Cells(ws.Rows.Count, regNoCol).End(xlUp).Row
     Dim absentees As String, r As Long, val As String, regNo As String
     For r = headerRow + 1 To lastRow
         val = UCase$(Trim$(CStr(ws.Cells(r, dateCol).Value)))
         If val = "AB" Or val = "ABSENT" Then
             regNo = Trim$(CStr(ws.Cells(r, regNoCol).Value))
-            regNo = Split(regNo, ".")(0) ' strip trailing .0 if any
+            If InStr(regNo, ".") > 0 Then
+                regNo = Split(regNo, ".")(0) ' strip trailing .0 if any
+            End If
             If absentees <> "" Then absentees = absentees & ","
             absentees = absentees & regNo
         End If
@@ -218,7 +236,4 @@ Private Function GetSubjectDetails() As String
     GetSubjectDetails = courseName & DETAILS_DELIM & courseCode & DETAILS_DELIM & _
                         semester & DETAILS_DELIM & classSection & DETAILS_DELIM & sessionNo
 End Function
-
-
-
 
