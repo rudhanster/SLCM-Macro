@@ -1,11 +1,11 @@
 Option Explicit
 
 ' ====== EDIT THESE TWO PATHS ======
-Private Const PYTHON_EXE As String = "C:\Users\anirudhanadukkathaya\AppData\Local\Microsoft\WindowsApps\python.exe"
+Private Const PYTHON_EXE As String = "C:\Windows\py.exe"   ' or full path to python.exe
 Private Const PY_SCRIPT  As String = "C:\Mac\Home\Documents\win\maa.py"
 ' ==================================
 
-' Delimiter used between subject fields (VBA ? Python)
+' Delimiter used between subject fields (VBA ↔ Python)
 Private Const DETAILS_DELIM As String = "|"
 
 ' ==============================================================
@@ -13,10 +13,11 @@ Private Const DETAILS_DELIM As String = "|"
 ' ==============================================================
 
 Public Sub RunAttendanceForActiveWorkbook()
+    On Error GoTo Fail
+
     Dim theDate As String, wbPath As String
     Dim absenteesList As String, subjectDetails As String
-    Dim args As String, runLine As String
-    Dim preview As String
+    Dim preview As String, runLine As String
 
     ' --- Get selected date ---
     theDate = GetSelectedDateString()
@@ -25,10 +26,11 @@ Public Sub RunAttendanceForActiveWorkbook()
         Exit Sub
     End If
 
-    ' --- Workbook path ---
-    wbPath = ThisWorkbook.FullName
-    If Len(wbPath) = 0 Then
-        MsgBox "Please save the workbook and try again.", vbExclamation
+    ' --- Workbook path (local copy if on SharePoint/OneDrive) ---
+    wbPath = GetWorkbookPathForPython(ThisWorkbook)
+    If Len(Dir$(wbPath, vbNormal)) = 0 Then
+        MsgBox "Could not find or create a local copy of the workbook for Python." & vbCrLf & _
+               "Path: " & wbPath, vbCritical
         Exit Sub
     End If
 
@@ -43,7 +45,7 @@ Public Sub RunAttendanceForActiveWorkbook()
     subjectDetails = GetSubjectDetails()
     If subjectDetails = "ERROR" Then Exit Sub
 
-    ' --- Confirmation (plain text, no emojis) ---
+    ' --- Confirmation ---
     preview = "Date: " & theDate & vbCrLf & _
               "Workbook: " & wbPath & vbCrLf & vbCrLf
     If Len(absenteesList) = 0 Then
@@ -54,9 +56,9 @@ Public Sub RunAttendanceForActiveWorkbook()
     preview = preview & vbCrLf & "Proceed to update SLCM attendance?"
     If MsgBox(preview, vbQuestion + vbOKCancel, "Confirm") <> vbOK Then Exit Sub
 
-    ' --- Path check ---
-    If Dir(PYTHON_EXE, vbNormal) = "" Then
-        MsgBox "Python not found: " & PYTHON_EXE, vbCritical
+    ' --- Path checks ---
+    If Dir(PYTHON_EXE, vbNormal) = "" And LCase$(PYTHON_EXE) <> LCase$("C:\Windows\py.exe") Then
+        MsgBox "Python not found: " & PYTHON_EXE & vbCrLf & "Tip: set to C:\Windows\py.exe", vbCritical
         Exit Sub
     End If
     If Dir(PY_SCRIPT, vbNormal) = "" Then
@@ -64,67 +66,59 @@ Public Sub RunAttendanceForActiveWorkbook()
         Exit Sub
     End If
 
-    ' --- Create a temporary batch file (most reliable approach) ---
-    Dim tempDir As String
-    Dim batFile As String
-    
-    tempDir = Environ("TEMP")
-    batFile = tempDir & "\slcm_automation_" & Format(Now, "yyyymmdd_hhnnss") & ".bat"
-    
-    ' Build batch file content
-    Dim batContent As String
-    batContent = "@echo off" & vbCrLf
-    batContent = batContent & "title SLCM Attendance Automation" & vbCrLf
-    batContent = batContent & "echo Starting SLCM Attendance Automation..." & vbCrLf
-    batContent = batContent & "echo." & vbCrLf
-    batContent = batContent & """" & PYTHON_EXE & """ """ & PY_SCRIPT & """ """ & theDate & """ """ & wbPath & """ """ & absenteesList & """ """ & subjectDetails & """" & vbCrLf
-    batContent = batContent & "echo." & vbCrLf
-    batContent = batContent & "echo Script execution completed." & vbCrLf
-    batContent = batContent & "echo Press any key to close this window..." & vbCrLf
-    batContent = batContent & "pause > nul" & vbCrLf
-    batContent = batContent & "del """ & batFile & """" & vbCrLf
-    
-    ' Write batch file
-    Dim fileNum As Integer
-    fileNum = FreeFile
-    Open batFile For Output As #fileNum
-    Print #fileNum, batContent
-    Close #fileNum
-    
-    ' Execute batch file
-    runLine = """" & batFile & """"
-    
+    ' --- Build command line ---
+    runLine = """" & PYTHON_EXE & """ """ & PY_SCRIPT & """ """ & theDate & _
+              """ """ & wbPath & """ """ & absenteesList & """ """ & subjectDetails & """"
+
     Debug.Print "Executing: " & runLine
 
-    ' --- Launch ---
+    ' --- Launch directly (no .bat, avoids Sophos block) ---
     Dim sh As Object
     Set sh = CreateObject("WScript.Shell")
-    sh.Run runLine, 1, False ' 1 = Normal window, False = Don't wait
-    
+    sh.Run runLine, 1, False    ' 1=normal window, False=don’t wait
 
+    Exit Sub
+
+Fail:
+    MsgBox "Error: " & Err.Description, vbCritical, "RunAttendanceForActiveWorkbook"
 End Sub
 
 ' ==============================================================
-' == POWERSHELL HELPERS ========================================
+' == HELPERS ===================================================
 ' ==============================================================
 
-' Properly quote strings for PowerShell
-Private Function PowerShellQuote(ByVal s As String) As String
-    ' Escape single quotes by doubling them, then wrap in single quotes
-    PowerShellQuote = "'" & Replace(s, "'", "''") & "'"
+' Get a local file path for Python (handles SharePoint/OneDrive)
+Private Function GetWorkbookPathForPython(ByVal wb As Workbook) As String
+    Dim fullName As String, localName As String
+    On Error Resume Next
+    fullName = wb.FullName
+    localName = wb.FullNameLocal
+    On Error GoTo 0
+
+    If Len(localName) > 0 And LCase$(Left$(localName, 4)) <> "http" Then
+        GetWorkbookPathForPython = localName
+        Exit Function
+    End If
+
+    ' Cloud-only: save a temp local copy
+    Dim tempDir As String, tempPath As String, baseName As String, ext As String
+    tempDir = Environ$("TEMP")
+    If Len(tempDir) = 0 Then tempDir = "C:\Temp"
+
+    baseName = wb.Name
+    If InStrRev(baseName, ".") > 0 Then
+        ext = Mid$(baseName, InStrRev(baseName, "."))
+        baseName = Left$(baseName, InStrRev(baseName, ".") - 1)
+    Else
+        ext = ".xlsx"
+    End If
+
+    tempPath = tempDir & "\" & baseName & "_pycopy_" & Format(Now, "yyyymmdd_hhnnss") & ext
+    wb.SaveCopyAs tempPath
+    GetWorkbookPathForPython = tempPath
 End Function
 
-' Escape arguments for PowerShell ArgumentList (comma-separated)
-Private Function EscapeForPowerShell(ByVal s As String) As String
-    ' For ArgumentList, we need to quote each argument properly
-    EscapeForPowerShell = PowerShellQuote(s)
-End Function
-
-' ==============================================================
-' == ORIGINAL HELPERS ==========================================
-' ==============================================================
-
-' Returns selected cell as m/d/yyyy when it's a date; otherwise plain text
+' Returns selected cell as m/d/yyyy if date; otherwise trimmed text
 Private Function GetSelectedDateString() As String
     On Error GoTo Fallback
     If TypeName(Selection) = "Range" Then
@@ -152,7 +146,9 @@ End Function
 
 ' Find absentees for a given date
 Private Function GetAbsenteesForDate(ByVal selectedDate As String) As String
-    Dim ws As Worksheet: Set ws = ThisWorkbook.Worksheets("Attendance")
+    Dim ws As Worksheet: On Error Resume Next
+    Set ws = ThisWorkbook.Worksheets("Attendance")
+    On Error GoTo 0
     If ws Is Nothing Then
         GetAbsenteesForDate = "E: Sheet 'Attendance' not found.": Exit Function
     End If
@@ -164,10 +160,11 @@ Private Function GetAbsenteesForDate(ByVal selectedDate As String) As String
         Exit Function
     End If
 
+    ' Locate "Reg. No." column
     Dim regNoCol As Long, c As Long
     For c = 1 To ws.Cells(headerRow, ws.Columns.Count).End(xlToLeft).Column
-        If InStr(1, UCase$(CStr(ws.Cells(headerRow, c).Value)), "REG") > 0 And _
-           InStr(1, UCase$(CStr(ws.Cells(headerRow, c).Value)), "NO") > 0 Then
+        Dim hdr As String: hdr = UCase$(Trim$(CStr(ws.Cells(headerRow, c).Value)))
+        If (InStr(hdr, "REG") > 0 And InStr(hdr, "NO") > 0) Or hdr = "REG. NO." Then
             regNoCol = c: Exit For
         End If
     Next
@@ -175,17 +172,18 @@ Private Function GetAbsenteesForDate(ByVal selectedDate As String) As String
         GetAbsenteesForDate = "E: Could not find 'Reg. No.' column.": Exit Function
     End If
 
+    ' Collect absentees
     Dim lastRow As Long: lastRow = ws.Cells(ws.Rows.Count, regNoCol).End(xlUp).Row
     Dim absentees As String, r As Long, val As String, regNo As String
     For r = headerRow + 1 To lastRow
-        val = UCase$(Trim$(CStr(ws.Cells(r, dateCol).Value)))
-        If val = "AB" Or val = "ABSENT" Then
+        val = Trim$(CStr(ws.Cells(r, dateCol).Value))
+        If LCase$(val) = "ab" Or LCase$(val) = "absent" Then
             regNo = Trim$(CStr(ws.Cells(r, regNoCol).Value))
-            If InStr(regNo, ".") > 0 Then
-                regNo = Split(regNo, ".")(0) ' strip trailing .0 if any
+            If InStr(regNo, ".") > 0 Then regNo = Split(regNo, ".")(0)
+            If Len(regNo) > 0 Then
+                If Len(absentees) > 0 Then absentees = absentees & ","
+                absentees = absentees & regNo
             End If
-            If absentees <> "" Then absentees = absentees & ","
-            absentees = absentees & regNo
         End If
     Next
 
@@ -200,7 +198,7 @@ Private Function FindDateColumn(ws As Worksheet, headerRow As Long, selectedDate
         v = ws.Cells(headerRow, c).Value
         If IsDate(v) And IsDate(selectedDate) Then
             If DateValue(v) = DateValue(CDate(selectedDate)) Then FindDateColumn = c: Exit Function
-        ElseIf CStr(v) = selectedDate Then
+        ElseIf Trim$(CStr(v)) = Trim$(selectedDate) Then
             FindDateColumn = c: Exit Function
         End If
     Next
@@ -208,7 +206,9 @@ End Function
 
 ' Build subject details string from Initial Setup sheet
 Private Function GetSubjectDetails() As String
-    Dim ws As Worksheet: Set ws = ThisWorkbook.Worksheets("Initial Setup")
+    Dim ws As Worksheet: On Error Resume Next
+    Set ws = ThisWorkbook.Worksheets("Initial Setup")
+    On Error GoTo 0
     If ws Is Nothing Then
         MsgBox "Sheet 'Initial Setup' not found.", vbCritical
         GetSubjectDetails = "ERROR": Exit Function
@@ -218,17 +218,15 @@ Private Function GetSubjectDetails() As String
     Dim courseCode As String:   courseCode = Trim$(CStr(ws.Cells(2, 2).Value)) ' B2
     Dim semester As String:     semester = Trim$(CStr(ws.Cells(3, 2).Value))   ' B3
     Dim classSection As String: classSection = Trim$(CStr(ws.Cells(4, 2).Value)) ' B4
-    Dim sessionNo As String:    sessionNo = Trim$(CStr(ws.Cells(5, 2).Value))  ' B5 (optional)
+    Dim sessionNo As String:    sessionNo = Trim$(CStr(ws.Cells(5, 2).Value))  ' B5 optional
 
     If Len(courseCode) = 0 Or Len(semester) = 0 Or Len(classSection) = 0 Then
         MsgBox "Please fill B2 (Course Code), B3 (Semester), and B4 (Class Section) on 'Initial Setup'.", vbCritical, "Subject details incomplete"
         GetSubjectDetails = "ERROR": Exit Function
     End If
 
-    ' Ensure the delimiter never appears in the fields
-    Dim badDelim As String: badDelim = DETAILS_DELIM
-    If InStr(courseName, badDelim) Or InStr(courseCode, badDelim) Or _
-       InStr(semester, badDelim) Or InStr(classSection, badDelim) Or InStr(sessionNo, badDelim) Then
+    If InStr(courseName, DETAILS_DELIM) Or InStr(courseCode, DETAILS_DELIM) Or _
+       InStr(semester, DETAILS_DELIM) Or InStr(classSection, DETAILS_DELIM) Or InStr(sessionNo, DETAILS_DELIM) Then
         MsgBox "Fields must not contain '" & DETAILS_DELIM & "'.", vbCritical
         GetSubjectDetails = "ERROR": Exit Function
     End If
@@ -236,5 +234,3 @@ Private Function GetSubjectDetails() As String
     GetSubjectDetails = courseName & DETAILS_DELIM & courseCode & DETAILS_DELIM & _
                         semester & DETAILS_DELIM & classSection & DETAILS_DELIM & sessionNo
 End Function
-
-
