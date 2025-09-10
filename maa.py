@@ -1,7 +1,25 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import sys, os, time, json, tempfile, shutil, re, unicodedata
+"""
+maa.py — SLCM Attendance automation (complete file)
+Includes:
+ - quick-precheck to avoid unnecessary month prev/next navigation
+ - collect_candidates() computing top relative to calendar wrapper
+ - click_fragment() which records window.__slcm_last_clicked_date
+ - robust panel_opened_ok() detection
+ - multi-step fallback when calendar navigation fails
+"""
+
+import sys
+import os
+import time
+import json
+import tempfile
+import shutil
+import re
+import unicodedata
+import calendar
 import pandas as pd
 from datetime import datetime, date
 
@@ -20,18 +38,20 @@ from selenium.common.exceptions import (
 )
 
 # -------- Tunables (you can tweak if needed) --------
-PANEL_READY_TIMEOUT    = 30     # seconds to wait for day panel to appear
-EVENT_SETTLE_TIMEOUT   = 25     # seconds to wait for list to “settle”
-EVENT_SEARCH_TIMEOUT   = 45     # total seconds to search/scroll for your tile
-SCROLL_STEP_FRACTION   = 0.60   # each calendar scroll moves ~60% of visible height
-SCROLL_PAUSE           = 0.30   # pause between calendar scrolls
-AFTER_DATE_CLICK_PAUSE = 1.5    # time for panel to re-render after date click
+PANEL_READY_TIMEOUT    = 30
+EVENT_SETTLE_TIMEOUT   = 25
+EVENT_SEARCH_TIMEOUT   = 45
+SCROLL_STEP_FRACTION   = 0.60
+SCROLL_PAUSE           = 0.30
+AFTER_DATE_CLICK_PAUSE = 1.0  # reduced for speed
 
-# Attendance table search limits so it never hangs
-SHORT_FIND_TIMEOUT        = 2   # (s) small waits for elements during search
-PER_STUDENT_MAX_SECONDS   = 5   # (s) hard cap per student search
-TABLE_SCROLL_TRIES        = 6   # small scroll steps
-TABLE_SCROLL_PAUSE        = 0.25
+SHORT_FIND_TIMEOUT        = 2
+PER_STUDENT_MAX_SECONDS   = 5
+TABLE_SCROLL_TRIES        = 6
+TABLE_SCROLL_PAUSE        = 0.20
+
+# Debugging for calendar nav
+DEBUG = False  # set False to reduce calendar debugging output
 
 # =========================================================
 # SLCM URLs
@@ -42,9 +62,6 @@ LOGIN_URL = "https://maheslcm.manipal.edu/login"
 
 # =========================================================
 # CLI parsing (date, workbook path, absentees, subject details)
-#   python maa.py <date> <workbook_path> <absentees> <subject_details>
-#   <absentees>        -> comma-separated IDs (e.g., "2301,2302")
-#   <subject_details>  -> "CourseName::CourseCode::Semester::ClassSection::SessionNo"
 # =========================================================
 def parse_arguments():
     if len(sys.argv) < 5:
@@ -57,9 +74,9 @@ def parse_arguments():
     return selected_date_str, workbook_path, absentees_str, subject_details_str
 
 # =========================================================
-# Date parsing (prefer MM/DD/YYYY for slash dates)
+# Date parsing helpers
 # =========================================================
-def excel_serial_to_date(n: float) -> date | None:
+def excel_serial_to_date(n):
     try:
         n = float(n)
     except Exception:
@@ -86,8 +103,7 @@ def excel_serial_to_date(n: float) -> date | None:
     candidates.sort(key=lambda d: abs((d - today).days))
     return candidates[0]
 
-def parse_date_any(s) -> date | None:
-    """Treat X/Y/Z as MM/DD/YYYY (so 8/1/2025 = Aug 1, 2025)."""
+def parse_date_any(s):
     if s is None:
         return None
     s = unicodedata.normalize("NFC", str(s)).strip()
@@ -99,7 +115,7 @@ def parse_date_any(s) -> date | None:
         as_float = float(s)
         d = excel_serial_to_date(as_float)
         if d:
-            print(f"📅 Parsed Excel serial {s} -> {d}")
+            if DEBUG: print(f"📅 Parsed Excel serial {s} -> {d}")
             return d
     except Exception:
         pass
@@ -110,13 +126,13 @@ def parse_date_any(s) -> date | None:
         if y1 < 100:
             y1 += 2000 if y1 < 50 else 1900
         try:
-            parsed = date(y1, m1, d1)  # MM/DD/YYYY
-            print(f"📅 Parsed '{s}' as MM/DD/YYYY -> {parsed}")
+            parsed = date(y1, m1, d1)
+            if DEBUG: print(f"📅 Parsed '{s}' as MM/DD/YYYY -> {parsed}")
             return parsed
         except ValueError:
             try:
                 parsed = date(y1, d1, m1)
-                print(f"📅 Parsed '{s}' as DD/MM/YYYY fallback -> {parsed}")
+                if DEBUG: print(f"📅 Parsed '{s}' as DD/MM/YYYY fallback -> {parsed}")
                 return parsed
             except ValueError:
                 pass
@@ -132,40 +148,33 @@ def parse_date_any(s) -> date | None:
     for f in fmts:
         try:
             parsed = datetime.strptime(s, f).date()
-            print(f"📅 Parsed '{s}' using '{f}' -> {parsed}")
+            if DEBUG: print(f"📅 Parsed '{s}' using '{f}' -> {parsed}")
             return parsed
         except Exception:
             continue
 
     try:
         parsed = pd.to_datetime(s, dayfirst=False).date()
-        print(f"📅 Parsed '{s}' via pandas (dayfirst=False) -> {parsed}")
+        if DEBUG: print(f"📅 Parsed '{s}' via pandas (dayfirst=False) -> {parsed}")
         return parsed
     except Exception:
-        print(f"❌ Could not parse date: {s}")
+        if DEBUG: print(f"❌ Could not parse date: {s}")
         return None
 
 # =========================================================
-# Subject details parsing (NO semester normalization)
+# Subject details parsing
 # =========================================================
-def parse_subject_details(details: str):
-    """
-    Accept "CourseName::CourseCode::Semester::ClassSection::SessionNo".
-    SessionNo may be blank.
-    Semester is preserved as-is (e.g., 'V' stays 'V').
-    """
+def parse_subject_details(details):
     raw = unicodedata.normalize("NFC", str(details or "")).strip()
     if not raw:
         return None, "empty subject details"
     if "::" in raw:
         parts = raw.split("::")
     else:
-        # backwards-compat with old pipes if ever used
         parts = raw.replace("^|", "|").split("|")
     parts += [""] * (5 - len(parts))
     course_name, course_code, semester, class_section, session_no = [p.strip() for p in parts[:5]]
 
-    # required checks
     missing = []
     if not course_code:   missing.append("Course Code")
     if not semester:      missing.append("Semester")
@@ -217,39 +226,668 @@ def hard_nav(driver, url, attempts=4):
         time.sleep(0.3)
     close_blank_tabs(driver); return False
 
-def click_calendar_date_fast(driver, day_number: str):
+# =========================================================
+# Mini-calendar helpers
+# =========================================================
+def _sidebar_month_label(driver):
     js = """
-    const wrap = document.querySelector('#calendarSidebar');
+    const wrap = document.querySelector('#calendarSidebar') || document.querySelector('.calendarSidebar') || document.getElementById('calendarSidebar');
+    if (!wrap) return null;
+    const all = wrap.querySelectorAll('*');
+    const texts = [];
+    for (const el of all) {
+      const txt = (el.innerText || el.textContent || '').trim();
+      if (txt) texts.push(txt);
+    }
+    return texts.join(" || ");
+    """
+    try:
+        raw = driver.execute_script(js)
+    except Exception:
+        return None
+    if not raw:
+        return None
+
+    m = re.search(r"\b(January|February|March|April|May|June|July|August|September|October|November|December|"
+                  r"Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)\b(?:[^0-9]{0,3}(\d{4}))?", raw, re.I)
+    if m:
+        mon = m.group(1)
+        yr = m.group(2)
+        return f"{mon} {yr}" if yr else mon
+    return None
+
+def _parse_month_label_to_date(lbl):
+    if not lbl:
+        return None, None
+    lbl = lbl.strip()
+
+    fmts = ("%B %Y", "%b %Y")
+    for f in fmts:
+        try:
+            dt = datetime.strptime(lbl, f)
+            return dt.year, dt.month
+        except Exception:
+            pass
+
+    try:
+        dt = datetime.strptime(lbl, "%B")
+    except Exception:
+        try:
+            dt = datetime.strptime(lbl, "%b")
+        except Exception:
+            return None, None
+    return date.today().year, dt.month
+
+def _click_sidebar_prev_next_once(driver, which):
+    js = """
+    const which = arguments[0];
+    const wrap = document.querySelector('#calendarSidebar') || document.querySelector('.calendarSidebar') || document.getElementById('calendarSidebar');
     if (!wrap) return false;
-    const nodes = wrap.querySelectorAll('table.datepicker .slds-day, .slds-day');
-    for (const n of nodes) {
-        const txt = (n.textContent || '').trim();
-        const disabled = n.getAttribute('aria-disabled') === 'true' || (n.className || '').includes('disabled');
-        if (!disabled && txt === arguments[0]) {
-            n.scrollIntoView({block:'center'});
-            n.click();
+    const candidates = [
+      "button[title='Previous Month']",
+      "button[title='Next Month']",
+      "button[aria-label='Previous Month']",
+      "button[aria-label='Next Month']",
+      ".slds-datepicker__nav .slds-button_icon",
+      ".uiDatePicker .ui-datepicker-prev",
+      ".uiDatePicker .ui-datepicker-next"
+    ];
+    for (const sel of candidates) {
+      try {
+        const el = wrap.querySelector(sel);
+        if (!el) continue;
+        if (sel === ".slds-datepicker__nav .slds-button_icon") {
+          const btns = wrap.querySelectorAll(".slds-datepicker__nav .slds-button_icon");
+          if (btns && btns.length >= 2) {
+            if (which === 'prev') { btns[0].click(); return true; }
+            else { btns[1].click(); return true; }
+          }
+        } else {
+          if (sel.includes('Previous') && which==='prev') { el.click(); return true; }
+          if (sel.includes('Next') && which==='next') { el.click(); return true; }
+          el.click(); return true;
+        }
+      } catch(e) {}
+    }
+    const arrows = Array.from(wrap.querySelectorAll('button, a'))
+                 .filter(n => (n.innerText||n.textContent||'').includes('◀') || (n.innerText||n.textContent||'').includes('▶') || n.className.indexOf('prev')>=0 || n.className.indexOf('next')>=0);
+    if (arrows.length) {
+      if (which === 'prev') { arrows[0].click(); return true; }
+      else { arrows[arrows.length-1].click(); return true; }
+    }
+    return false;
+    """
+    try:
+        return bool(driver.execute_script(js, which))
+    except Exception:
+        return False
+
+# ---------- Enhanced click function with proper date filtering ----------
+def click_calendar_date_fast(driver, day_number, target_date=None):
+    def get_shown_month_index():
+        lbl = _sidebar_month_label(driver)
+        if lbl:
+            y,m = _parse_month_label_to_date(lbl)
+            if y and m:
+                return y*12 + m
+        td = date.today()
+        return td.year*12 + td.month
+
+    def collect_candidates():
+        js = """
+        const day = arguments[0];
+        const targetDate = arguments[1]; // YYYY-MM-DD format
+        const wrap = document.querySelector('#calendarSidebar') || document.querySelector('.calendarSidebar') || document.getElementById('calendarSidebar');
+        if (!wrap) return [];
+        const wrapRect = wrap.getBoundingClientRect();
+        const nodes = Array.from(wrap.querySelectorAll('*'));
+        const out = [];
+        for (const n of nodes) {
+          try {
+            const txt = (n.innerText || n.textContent || '').trim();
+            if (txt !== day) continue;
+            
+            const dataDate = (n.getAttribute('data-date') || '').trim();
+            const cls = (n.className || '').toLowerCase();
+            const aria = (n.getAttribute('aria-label') || '').trim();
+            const title = (n.getAttribute('title') || '').trim();
+            const rect = n.getBoundingClientRect();
+            
+            // Calculate top relative to the calendar wrapper so 'top row' is always smaller
+            let relTop = 0;
+            if (wrapRect && rect && typeof wrapRect.top === 'number' && typeof rect.top === 'number') {
+              relTop = Math.max(0, rect.top - wrapRect.top);
+            } else {
+              relTop = rect.top || 0;
+            }
+            
+            // Check if this is a disabled/grayed out date
+            const isDisabled = cls.includes('disabled') || 
+                              cls.includes('slds-disabled') ||
+                              cls.includes('slds-disabled-text') ||
+                              cls.includes('prevmonth') || 
+                              cls.includes('nextmonth') ||
+                              cls.includes('outside') ||
+                              cls.includes('adjacent') ||
+                              cls.includes('other-month') ||
+                              n.getAttribute('aria-disabled') === 'true';
+            
+            // Exact data-date match gets highest priority
+            let priority = 0;
+            if (targetDate && dataDate === targetDate) {
+              priority = 100;
+            } else if (targetDate && dataDate && dataDate.includes(targetDate.split('-')[0] + '-' + targetDate.split('-')[1])) {
+              priority = 90;
+            } else if (!isDisabled) {
+              priority = 50;
+            } else {
+              priority = 10; // Low priority for disabled dates
+            }
+            
+            out.push({
+              top: relTop,
+              html: n.outerHTML || '',
+              cls: cls,
+              aria: aria,
+              title: title,
+              dataDate: dataDate,
+              isDisabled: isDisabled,
+              priority: priority
+            });
+          } catch(e) {}
+        }
+        return out;
+        """
+        try:
+            target_date_str = target_date.strftime("%Y-%m-%d") if target_date else None
+            return driver.execute_script(js, str(day_number), target_date_str)
+        except Exception:
+            return []
+
+    def click_fragment(html_frag):
+        js_click = """
+        const frag = arguments[0];
+        const wrap = document.querySelector('#calendarSidebar') || document.querySelector('.calendarSidebar') || document.getElementById('calendarSidebar');
+        if (!wrap) return false;
+        const nodes = Array.from(wrap.querySelectorAll('*'));
+        for (const n of nodes) {
+          try {
+            if ((n.outerHTML || '').indexOf(frag) !== -1) {
+              let dataDate = n.getAttribute('data-date') || '';
+              if (!dataDate) {
+                const aria = (n.getAttribute('aria-label')||n.getAttribute('title')||'').trim();
+                const m = aria.match(/([A-Za-z]+)\\s+(\\d{1,2}),?\\s*(\\d{4})/);
+                if (m) {
+                  const mm = new Date(Date.parse(m[1] + ' 1, ' + m[3])).getMonth() + 1;
+                  const dd = String(m[2]).padStart(2,'0');
+                  const mo = String(mm).padStart(2,'0');
+                  dataDate = `${m[3]}-${mo}-${dd}`;
+                }
+              }
+              try { window.__slcm_last_clicked_date = dataDate || ''; } catch(e){}
+              n.scrollIntoView({block:'center'});
+              try { n.click(); } catch(e) { n.dispatchEvent(new MouseEvent('click',{bubbles:true})); }
+              return true;
+            }
+          } catch(e){}
+        }
+        return false;
+        """
+        try:
+            return bool(driver.execute_script(js_click, html_frag))
+        except Exception:
+            return False
+
+    def click_main_grid(target_date):
+        js = """
+        const day = arguments[0], month = arguments[1], year = arguments[2];
+        const patt1 = month + " " + day + ", " + year;
+        const patt2 = month + " " + day + " " + year;
+        const nodes = Array.from(document.querySelectorAll('*'));
+        for (const n of nodes) {
+          try {
+            const a = (n.getAttribute('aria-label')||'') + '||' + (n.getAttribute('title')||'') + '||' + (n.getAttribute('data-date')||'') + '||' + (n.innerText||n.textContent||'');
+            if (a.indexOf(patt1) !== -1 || a.indexOf(patt2) !== -1 || a.indexOf(month + ' ' + day) !== -1) {
+              n.scrollIntoView({block:'center'});
+              try { n.click(); } catch(e) { n.dispatchEvent(new MouseEvent('click',{bubbles:true})); }
+              return true;
+            }
+          } catch(e){}
+        }
+        for (const n of nodes) {
+          try { 
+            const txt = (n.innerText||n.textContent||'').trim();
+            const cls = (n.className || '').toLowerCase();
+            const isDisabled = cls.includes('disabled') || cls.includes('slds-disabled') || cls.includes('prevmonth') || cls.includes('nextmonth');
+            if (txt === String(day) && !isDisabled) { 
+              n.scrollIntoView({block:'center'}); 
+              try{ n.click(); } catch(e){ n.dispatchEvent(new MouseEvent('click',{bubbles:true})); } 
+              return true; 
+            } 
+          } catch(e){}
+        }
+        return false;
+        """
+        try:
+            return bool(driver.execute_script(js, target_date.day, target_date.strftime("%B"), target_date.year))
+        except Exception:
+            return False
+
+    def panel_opened_ok():
+        time.sleep(0.5)
+
+        def _has_event_list(elem):
+            try:
+                if hasattr(elem, "find_element"):
+                    try:
+                        elem.find_element(By.CSS_SELECTOR, "div.eventList, div.calendarDay, ul.eventListContainer")
+                        return True
+                    except Exception:
+                        return False
+                else:
+                    return bool(driver.execute_script("""
+                        const n = arguments[0];
+                        try {
+                          if (!n) return false;
+                          if (n.querySelector && (n.querySelector('div.eventList') || n.querySelector('div.calendarDay') || n.querySelector('ul.eventListContainer'))) return true;
+                        } catch(e){}
+                        return false;
+                    """, elem))
+            except Exception:
+                return False
+
+        last_clicked = None
+        try:
+            last_clicked = driver.execute_script("return (window.__slcm_last_clicked_date || null);")
+        except Exception:
+            last_clicked = None
+
+        if DEBUG:
+            print("panel_opened_ok: last_clicked_date =", repr(last_clicked))
+
+        if last_clicked:
+            try:
+                panel_candidate = None
+                try:
+                    panel_candidate = driver.execute_script("""
+                        const target = arguments[0];
+                        let el = document.querySelector("[data-date='" + target + "']");
+                        if (el) {
+                          const p = el.closest('div.calendarDay') || el.closest('section') || el.closest('div');
+                          return p || el;
+                        }
+                        const all = Array.from(document.querySelectorAll('div, section, article, h2, a, span'));
+                        for (const n of all) {
+                          try {
+                            const attrs = ((n.getAttribute && (n.getAttribute('aria-description') || n.getAttribute('aria-label') || n.getAttribute('title'))) || '') + ' ' + (n.innerText || n.textContent || '');
+                            if (attrs.indexOf(target) !== -1) return n;
+                          } catch(e){}
+                        }
+                        return null;
+                    """, last_clicked)
+                except Exception:
+                    panel_candidate = None
+
+                if DEBUG:
+                    try:
+                        desc = None
+                        if panel_candidate:
+                            desc = driver.execute_script("return (arguments[0].getAttribute && (arguments[0].getAttribute('aria-description') || arguments[0].getAttribute('aria-label') || arguments[0].getAttribute('title'))) || (arguments[0].innerText||arguments[0].textContent||'');", panel_candidate)
+                        print("panel_opened_ok: panel_candidate (by data-date) present?:", bool(panel_candidate), " sample_text:", repr(desc))
+                    except Exception:
+                        print("panel_opened_ok: panel_candidate present (could not fetch sample text)")
+
+                if panel_candidate and _has_event_list(panel_candidate):
+                    if DEBUG: print("panel_opened_ok: matched panel by data-date and it contains event list -> OK")
+                    return True
+
+                if panel_candidate:
+                    try:
+                        nearby = driver.execute_script("""
+                            const n = arguments[0];
+                            if (!n) return null;
+                            const p = n.closest ? (n.closest('div.calendarDay') || n.closest('section') || n.closest('div')) : null;
+                            return p || null;
+                        """, panel_candidate)
+                        if DEBUG: print("panel_opened_ok: nearby candidate found:", bool(nearby))
+                        if nearby and _has_event_list(nearby):
+                            if DEBUG: print("panel_opened_ok: nearby contains event list -> OK")
+                            return True
+                    except Exception:
+                        pass
+
+                try:
+                    found_via_aria = driver.execute_script("""
+                        const target = arguments[0];
+                        const nodes = Array.from(document.querySelectorAll('[aria-description], [aria-label], [title]'));
+                        for (const n of nodes) {
+                          try {
+                            const txt = ((n.getAttribute && (n.getAttribute('aria-description') || n.getAttribute('aria-label') || n.getAttribute('title'))) || '') + ' ' + (n.innerText || n.textContent || '');
+                            if (txt.indexOf(target) !== -1) return n;
+                          } catch(e){}
+                        }
+                        return null;
+                    """, last_clicked)
+                    if found_via_aria and _has_event_list(found_via_aria):
+                        if DEBUG: print("panel_opened_ok: matched via aria/title and has event list -> OK")
+                        return True
+                except Exception:
+                    pass
+
+            except Exception:
+                if DEBUG: print("panel_opened_ok: exception during data-date panel search (falling back)", sys.exc_info()[0])
+
+        try:
+            panel = find_day_panel_for_date(driver, target_date)
+            if panel:
+                if DEBUG: print("panel_opened_ok: found panel using header-based detection")
+                try:
+                    panel.find_element(By.CSS_SELECTOR, "div.eventList, div.calendarDay, ul.eventListContainer")
+                    if DEBUG: print("panel_opened_ok: header-panel contains event list -> OK")
+                    return True
+                except Exception:
+                    if DEBUG: print("panel_opened_ok: header-panel exists but no event list found; accepting panel existence")
+                    return True
+        except Exception:
+            if DEBUG: print("panel_opened_ok: header-based detection raised exception", sys.exc_info()[0])
+
+        try:
+            expected = [h.lower() for h in day_header_strings(target_date)]
+            headers = driver.find_elements(By.CSS_SELECTOR, "h2, h3, h1")
+            for h in headers:
+                try:
+                    txt = _norm(h.text).lower()
+                    for exp in expected:
+                        if exp in txt:
+                            if DEBUG: print("panel_opened_ok: matched header text (relaxed) ->", txt)
+                            try:
+                                cand = h.find_element(By.XPATH, "following-sibling::div[contains(@class,'calendarDay') or contains(@class,'eventList')][1]")
+                                if cand:
+                                    if DEBUG: print("panel_opened_ok: header-following container present -> OK")
+                                    return True
+                            except Exception:
+                                return True
+                except Exception:
+                    continue
+        except Exception:
+            if DEBUG: print("panel_opened_ok: relaxed header scan error", sys.exc_info()[0])
+
+        if DEBUG: print("panel_opened_ok: no matching panel detected for", target_date)
+        return False
+
+    # If no target_date, attempt a simple direct click with disabled filtering
+    if target_date is None:
+        js_direct = """
+        const wrap = document.querySelector('#calendarSidebar') || document.querySelector('.calendarSidebar') || document.getElementById('calendarSidebar');
+        if (!wrap) return false;
+        const nodes = wrap.querySelectorAll('table.datepicker .slds-day, .slds-day, table.datepicker td, table td, td');
+        for (const n of nodes) {
+            const txt = (n.textContent || '').trim();
+            const cls = (n.className || '').toLowerCase();
+            const disabled = n.getAttribute && (
+                n.getAttribute('aria-disabled') === 'true' ||
+                cls.includes('disabled') || 
+                cls.includes('slds-disabled') ||
+                cls.includes('prevmonth') || 
+                cls.includes('nextmonth') ||
+                cls.includes('outside') ||
+                cls.includes('adjacent')
+            );
+            if (!disabled && txt === arguments[0]) { 
+                n.scrollIntoView({block:'center'}); 
+                try{ n.click(); } catch(e){} 
+                return true; 
+            }
+        }
+        return false;
+        """
+        try:
+            ok = driver.execute_script(js_direct, str(day_number))
+        except Exception:
+            ok = False
+        if not ok:
+            raise RuntimeError(f"❌ Could not click mini calendar date {day_number}")
+        return
+
+        # ---------- SAFE QUICK PRE-CHECK (avoid ambiguous sidebar clicks; jump to robust) ----------
+    try:
+        pre_cands = collect_candidates()
+    except Exception:
+        pre_cands = []
+
+    # Helper: candidate unambiguous if it has exact dataDate OR month/year in aria/title
+    def unambiguous_for_target(c):
+        dd = (c.get('dataDate') or "").strip()
+        if dd and target_date and dd == target_date.strftime("%Y-%m-%d"):
+            return True
+        txt = ((c.get('aria') or "") + " " + (c.get('title') or "")).strip()
+        if txt:
+            mon = target_date.strftime("%B") if target_date else ""
+            yr = str(target_date.year) if target_date else ""
+            if mon and mon.lower() in txt.lower():
+                return True
+            if yr and yr in txt:
+                return True
+        return False
+
+    # 1) Exact data-date in sidebar candidates (highest confidence)
+    if pre_cands:
+        exact_now = [c for c in pre_cands if c.get('dataDate') and target_date and c.get('dataDate') == target_date.strftime("%Y-%m-%d")]
+        if exact_now:
+            pick = sorted(exact_now, key=lambda c: (c.get('top', 0)))[0]
+            if DEBUG: print("quick-precheck: clicking exact data-date candidate (no nav needed)")
+            if click_fragment(pick.get('html')) and panel_opened_ok():
+                if DEBUG: print("✅ Quick precheck exact click succeeded")
+                return
+
+    # 2) Try global data-date anywhere on page (very reliable)
+    try:
+        if target_date:
+            target_dd = target_date.strftime("%Y-%m-%d")
+            if DEBUG: print("quick-precheck: looking for global data-date element", target_dd)
+            clicked_global = driver.execute_script("""
+                const t = arguments[0];
+                const el = document.querySelector("[data-date='" + t + "']");
+                if (!el) return false;
+                try { el.scrollIntoView({block:'center'}); } catch(e){}
+                try { el.click(); } catch(e){ el.dispatchEvent(new MouseEvent('click',{bubbles:true})); }
+                return true;
+            """, target_dd)
+            if clicked_global:
+                time.sleep(0.12)
+                if panel_opened_ok():
+                    if DEBUG: print("✅ Quick precheck global data-date click succeeded")
+                    return
+                # else continue to robust path if it didn't open correct panel
+    except Exception:
+        pass
+
+    # 3) If sidebar has only ambiguous candidates (no dataDate and no aria/title month/year),
+    #    DO NOT click them — jump straight to robust navigation which is reliable.
+    if pre_cands:
+        non_disabled_now = [c for c in pre_cands if not c.get('isDisabled', False)]
+        if non_disabled_now:
+            unamb = [c for c in non_disabled_now if unambiguous_for_target(c)]
+            ambiguous = [c for c in non_disabled_now if not unambiguous_for_target(c)]
+            if DEBUG and ambiguous:
+                sample = []
+                for c in ambiguous[:6]:
+                    sample.append({
+                        'cls': c.get('cls'),
+                        'dataDate': c.get('dataDate'),
+                        'aria': (c.get('aria') or '')[:60],
+                        'top': c.get('top')
+                    })
+                print("quick-precheck: skipped ambiguous sidebar candidates:", sample)
+
+            # If we have unambiguous candidates, try them (safe).
+            if unamb:
+                pick = sorted(unamb, key=lambda c: (c.get('top', 0)))[0]
+                if DEBUG: print("quick-precheck: clicking unambiguous same-month candidate, cls=", pick.get('cls'))
+                if click_fragment(pick.get('html')) and panel_opened_ok():
+                    if DEBUG: print("✅ Quick precheck unambiguous click succeeded")
+                    return
+            else:
+                # No safe candidate available — use robust navigation immediately to avoid wasted clicks
+                if DEBUG: print("quick-precheck: no safe sidebar candidate found — invoking robust navigator")
+                try:
+                    click_calendar_date_robust(driver, target_date)
+                    return
+                except Exception as e:
+                    if DEBUG: print("quick-precheck: robust navigator raised:", repr(e))
+                    # fall through to the normal nav logic below (it will try again)
+    # If we reach here, no safe quick precheck succeeded — proceed to month navigation as before.
+
+    # navigate to target month (bounded)
+    MAX_NAV = 24
+    target_month_index = target_date.year*12 + target_date.month
+    shown_month_index = get_shown_month_index()
+    nav_count = 0
+    while shown_month_index != target_month_index and nav_count < MAX_NAV:
+        direction = 'next' if target_month_index > shown_month_index else 'prev'
+        if DEBUG: print("nav step: shown", shown_month_index, " target", target_month_index, " ->", direction)
+        if not _click_sidebar_prev_next_once(driver, direction):
+            if DEBUG: print("nav control not found for", direction)
+            break
+        time.sleep(0.10)
+        nav_count += 1
+        shown_month_index = get_shown_month_index()
+
+    # collect candidates with enhanced filtering
+    candidates = collect_candidates()
+    if not candidates:
+        raise RuntimeError(f"❌ No mini-calendar candidates found for day {day_number}")
+
+    candidates_sorted = sorted(candidates, key=lambda c: (-c.get('priority', 0), c.get('top', 0)))
+
+    click_order = []
+    exact_matches = [c for c in candidates_sorted if c.get('priority', 0) >= 90]
+    if exact_matches:
+        click_order.extend(exact_matches)
+    non_disabled = [c for c in candidates_sorted if not c.get('isDisabled', False) and c not in click_order]
+    if non_disabled:
+        click_order.extend(non_disabled)
+    remaining = [c for c in candidates_sorted if c not in click_order]
+    click_order.extend(remaining)
+
+    MAX_TRIES = max(6, len(click_order)*2)
+    tried = 0
+
+    for idx, candidate in enumerate(click_order):
+        if tried >= MAX_TRIES:
+            break
+        tried += 1
+        if DEBUG:
+            lbl = _sidebar_month_label(driver)
+            print(f"[click attempt] trying day {day_number} (label={lbl}) candidate #{idx+1} priority={candidate.get('priority')} disabled={candidate.get('isDisabled')} cls={candidate.get('cls')}")
+        clicked = click_fragment(candidate.get('html'))
+        if not clicked:
+            if DEBUG: print("candidate click failed, continuing")
+            time.sleep(0.10)
+            continue
+        if panel_opened_ok():
+            if DEBUG: print(f"✅ Clicked calendar date: {day_number} (candidate #{idx+1})")
+            return
+        else:
+            if DEBUG: print("⚠️ Clicked but wrong panel — will try next candidate")
+            time.sleep(0.10)
+            continue
+
+    # fallback to main-grid with enhanced filtering
+    if DEBUG: print("Attempting fallback click on main calendar grid for", target_date)
+    if click_main_grid(target_date):
+        if panel_opened_ok():
+            if DEBUG: print("✅ Main-grid fallback click opened correct day panel")
+            return
+        if DEBUG: print("Fallback main-grid click did not open correct panel")
+
+    # final nudge and reattempt
+    if DEBUG: print("Final attempt: nudging month then re-collecting candidates")
+    _click_sidebar_prev_next_once(driver, 'next'); time.sleep(0.10)
+    _click_sidebar_prev_next_once(driver, 'prev'); time.sleep(0.10)
+    candidates = collect_candidates()
+    candidates_sorted = sorted(candidates, key=lambda c: (-c.get('priority', 0), c.get('top', 0)))
+    for c in candidates_sorted:
+        if not c.get('isDisabled', False) and click_fragment(c.get('html')) and panel_opened_ok():
+            if DEBUG: print("✅ Clicked after nudge")
+            return
+
+    raise RuntimeError(f"❌ Could not click mini calendar date {day_number} (last known label={repr(_sidebar_month_label(driver))}) after retries")
+
+# =========================================================
+# Alternative robust approach for problematic calendars
+# =========================================================
+def click_calendar_date_robust(driver, target_date):
+    def get_shown_month_index():
+        lbl = _sidebar_month_label(driver)
+        if lbl:
+            y,m = _parse_month_label_to_date(lbl)
+            if y and m:
+                return y*12 + m
+        td = date.today()
+        return td.year*12 + td.month
+
+    current_month_index = get_shown_month_index()
+    target_month_index = target_date.year * 12 + target_date.month
+
+    max_nav_attempts = 24
+    nav_count = 0
+    while current_month_index != target_month_index and nav_count < max_nav_attempts:
+        direction = 'next' if target_month_index > current_month_index else 'prev'
+        if DEBUG: print(f"Navigating {direction} from month index {current_month_index} to {target_month_index}")
+        if not _click_sidebar_prev_next_once(driver, direction):
+            if DEBUG: print(f"Navigation control not found for {direction}")
+            break
+        time.sleep(0.12)
+        nav_count += 1
+        current_month_index = get_shown_month_index()
+
+    if current_month_index != target_month_index and DEBUG:
+        print(f"Warning: Could not navigate to target month. Current: {current_month_index}, Target: {target_month_index}")
+
+    js_click_current_month_date = """
+    const day = arguments[0];
+    const wrap = document.querySelector('#calendarSidebar') || document.querySelector('.calendarSidebar');
+    if (!wrap) return false;
+    const cells = wrap.querySelectorAll('td, .slds-day, button, a');
+    for (const cell of cells) {
+        const text = (cell.innerText || cell.textContent || '').trim();
+        const classes = (cell.className || '').toLowerCase();
+        if (text === day && 
+            !classes.includes('disabled') && 
+            !classes.includes('slds-disabled') &&
+            !classes.includes('slds-disabled-text') &&
+            !classes.includes('prevmonth') &&
+            !classes.includes('nextmonth') &&
+            !classes.includes('outside') &&
+            !classes.includes('adjacent') &&
+            !classes.includes('other-month') &&
+            cell.getAttribute('aria-disabled') !== 'true') {
+            cell.scrollIntoView({block: 'center'});
+            try { cell.click(); } catch(e) { cell.dispatchEvent(new MouseEvent('click', {bubbles: true})); }
             return true;
         }
     }
     return false;
     """
-    ok = driver.execute_script(js, day_number)
-    if not ok:
-        raise RuntimeError(f"❌ Could not click mini calendar date {day_number}")
-    print(f"✅ Clicked calendar date: {day_number}")
 
-def _norm(s: str) -> str:
+    day_str = str(target_date.day)
+    if driver.execute_script(js_click_current_month_date, day_str):
+        if DEBUG: print(f"✅ Successfully clicked date {target_date} using robust method")
+        return True
+
+    raise RuntimeError(f"❌ Could not click date {target_date} after navigating to correct month")
+
+# =========================================================
+# Remaining helpers (events scanning, attendance manipulation)
+# =========================================================
+def _norm(s):
     return " ".join((s or "").split())
 
-def _has_word(haystack: str, needle: str) -> bool:
+def _has_word(haystack, needle):
     return re.search(rf'\b{re.escape(needle)}\b', haystack) is not None
 
-def matches_event_text(txt: str, code: str, sem: str, sec: str, sess: str | None) -> bool:
-    """
-    Section 'B' must NOT match 'B-1'/'B-2'.
-    Section 'B-1' must match exactly that token.
-    Session is ignored if section already has '-'.
-    """
+def matches_event_text(txt, code, sem, sec, sess):
     def norm(s): return " ".join((s or "").split()).upper()
     T = norm(txt)
 
@@ -261,36 +899,35 @@ def matches_event_text(txt: str, code: str, sem: str, sec: str, sess: str | None
 
     if sec:
         secU = sec.strip().upper()
-
         if "-" in secU:
-            # exact token match for things like B-1 (not part of a longer token)
             pat = rf'(?<![A-Z0-9]){re.escape(secU)}(?![A-Z0-9])'
             ok = ok and re.search(pat, T) is not None
         else:
-            # letter section like B — must NOT match B-1/B-2
             pat1 = rf'\bSEC(?:TION)?\s*[:\-]?\s*{re.escape(secU)}(?!\s*-\s*\d+)\b'
             pat2 = rf'\(\s*{re.escape(secU)}\s*\)'
             pat3 = rf'(?<![A-Z0-9]){re.escape(secU)}(?!\s*-\s*\d+)(?![A-Z0-9])'
-
             ok = ok and (
                 re.search(pat1, T) is not None or
                 re.search(pat2, T) is not None or
                 re.search(pat3, T) is not None
             )
 
-    # Only use session when section is broad (no dash)
     if ok and sess and sess.strip() and (not sec or "-" not in sec.strip()):
         s = sess.strip().upper()
         ok = ok and (f"SESSION {s}" in T)
 
     return ok
 
-# ---------- Day panel helpers ----------
-def day_header_strings(d: date):
-    parts = [
-        d.strftime("%A, %B %-d") if sys.platform != "win32" else d.strftime("%A, %B %#d"),
-        d.strftime("%A, %B %d").lstrip("0").replace(", 0", ", "),
-    ]
+def day_header_strings(d):
+    parts = []
+    try:
+        if sys.platform != "win32":
+            parts.append(d.strftime("%A, %B %-d"))
+        else:
+            parts.append(d.strftime("%A, %B %#d"))
+    except Exception:
+        parts.append(d.strftime("%A, %B %d").lstrip("0").replace(", 0", ", "))
+    parts.append(d.strftime("%A, %B %d").lstrip("0").replace(", 0", ", "))
     seen, out = set(), []
     for s in parts:
         s = _norm(s)
@@ -351,7 +988,7 @@ def wait_for_events_to_settle(driver, panel, timeout=EVENT_SETTLE_TIMEOUT):
         time.sleep(0.25)
     return False
 
-def aria_date_matches_selected(aria_desc: str, selected_date: date) -> bool:
+def aria_date_matches_selected(aria_desc, selected_date):
     if not aria_desc:
         return False
     txt = aria_desc.replace("–", "-")
@@ -464,7 +1101,7 @@ def main():
     print("\n📘 Course Details")
     print(f"   Course Name   : {course_name or '(blank)'}")
     print(f"   Course Code   : {course_code or '(blank)'}")
-    print(f"   Semester      : {semester or '(blank)'}")   # NOTE: kept as-is (no V->5)
+    print(f"   Semester      : {semester or '(blank)'}")
     print(f"   Class Section : {class_section or '(blank)'}")
     print(f"   Session No    : {session_no or '(none)'}")
 
@@ -496,19 +1133,14 @@ def main():
         opts.add_argument(f"--user-data-dir={user_data_dir}")
         opts.add_argument("--no-first-run")
         opts.add_argument("--no-default-browser-check")
-        
-        # Suppress log messages
-        opts.add_argument("--log-level=3")  # Only show fatal errors
+        opts.add_argument("--log-level=3")
         opts.add_argument("--disable-logging")
         opts.add_argument("--disable-dev-shm-usage")
-        opts.add_argument("--no-sandbox")  # May help with some warnings
-        
-        # Disable unnecessary features that generate logs
+        opts.add_argument("--no-sandbox")
         opts.add_argument("--disable-background-timer-throttling")
         opts.add_argument("--disable-backgrounding-occluded-windows")
         opts.add_argument("--disable-renderer-backgrounding")
         opts.add_argument("--disable-features=TranslateUI,VizDisplayCompositor")
-        
         return opts
 
     def start_driver_with_fallback():
@@ -527,7 +1159,7 @@ def main():
     driver = start_driver_with_fallback()
 
     try:
-        # Go to Home (user completes SSO if needed)
+        # Navigate & login
         if not hard_nav(driver, HOME_URL):
             hard_nav(driver, BASE_URL)
             hard_nav(driver, HOME_URL)
@@ -549,21 +1181,133 @@ def main():
         js_click(driver, cal_tab)
         print("✅ Opened Calendar")
 
-        # Wait for mini calendar & click selected date
+        # Wait for mini calendar & click selected date (robust with fallbacks)
         WebDriverWait(driver, 12).until(EC.presence_of_element_located((By.ID, "calendarSidebar")))
         time.sleep(0.25)
         day_number = str(selected_date.day).lstrip("0")
-        click_calendar_date_fast(driver, day_number)
-        time.sleep(AFTER_DATE_CLICK_PAUSE)  # give time to repaint day panel
 
-        # === robust wait for correct day panel, then wait for events to settle
-        panel = wait_for_day_panel_ready(driver, selected_date, timeout=PANEL_READY_TIMEOUT)
+        def try_wait_panel(timeout=PANEL_READY_TIMEOUT):
+            p = wait_for_day_panel_ready(driver, selected_date, timeout=timeout)
+            if p:
+                if DEBUG: print("wait_for_day_panel_ready: panel found")
+            else:
+                if DEBUG: print("wait_for_day_panel_ready: panel NOT found")
+            return p
+
+        # Primary attempt: fast click then wait
+        try:
+            if DEBUG: print("Attempting click_calendar_date_fast(...)")
+            click_calendar_date_fast(driver, day_number, target_date=selected_date)
+        except Exception as e_fast:
+            if DEBUG:
+                print("click_calendar_date_fast raised:", repr(e_fast))
+
+        time.sleep(AFTER_DATE_CLICK_PAUSE)
+        panel = try_wait_panel(timeout=PANEL_READY_TIMEOUT)
+
+        # Fallback 1: use the robust navigation+click method and wait again
         if not panel:
-            raise RuntimeError("❌ Could not locate the correct day panel for the selected date.")
+            try:
+                if DEBUG: print("Fallback: click_calendar_date_robust(...)")
+                ok = click_calendar_date_robust(driver, selected_date)
+                if ok:
+                    time.sleep(AFTER_DATE_CLICK_PAUSE)
+                panel = try_wait_panel(timeout=PANEL_READY_TIMEOUT)
+            except Exception as e_rob:
+                if DEBUG: print("click_calendar_date_robust raised:", repr(e_rob))
+                panel = None
+
+        # Fallback 2: Try to click any element with exact data-date anywhere on the page
+        if not panel:
+            try:
+                target_dd = selected_date.strftime("%Y-%m-%d")
+                if DEBUG: print("Fallback: clicking any element with data-date=", target_dd)
+                clicked = driver.execute_script("""
+                    const target = arguments[0];
+                    const el = document.querySelector("[data-date='" + target + "']");
+                    if (!el) {
+                      const all = Array.from(document.querySelectorAll('[data-date], [data-dt], [data-day]'));
+                      for (const n of all) {
+                        const v = (n.getAttribute('data-date')||n.getAttribute('data-dt')||n.getAttribute('data-day')||'').trim();
+                        if (v === target) { n.scrollIntoView({block:'center'}); try{ n.click(); }catch(e){ n.dispatchEvent(new MouseEvent('click',{bubbles:true})); } return true; }
+                      }
+                      return false;
+                    }
+                    el.scrollIntoView({block:'center'});
+                    try { el.click(); } catch(e) { el.dispatchEvent(new MouseEvent('click',{bubbles:true})); }
+                    return true;
+                """, target_dd)
+                if DEBUG: print("Fallback data-date click returned:", bool(clicked))
+                time.sleep(AFTER_DATE_CLICK_PAUSE)
+                panel = try_wait_panel(timeout=PANEL_READY_TIMEOUT)
+            except Exception as e:
+                if DEBUG: print("data-date fallback raised:", repr(e))
+                panel = None
+
+        # Fallback 3: try a sidebar JS click for visible, non-disabled cell matching the day text
+        if not panel:
+            try:
+                if DEBUG: print("Fallback: clicking visible non-disabled cell inside calendarSidebar with day text")
+                clicked = driver.execute_script("""
+                    const day = arguments[0].trim();
+                    const wrap = document.querySelector('#calendarSidebar') || document.querySelector('.calendarSidebar');
+                    if (!wrap) return false;
+                    const cells = Array.from(wrap.querySelectorAll('td, button, a, div, span'));
+                    for (const c of cells) {
+                        try {
+                            const txt = (c.innerText || c.textContent || '').trim();
+                            const cls = (c.className||'').toLowerCase();
+                            const disabled = cls.includes('disabled') || cls.includes('prevmonth') || cls.includes('nextmonth') || (c.getAttribute && c.getAttribute('aria-disabled') === 'true');
+                            if (!disabled && txt === day) {
+                                c.scrollIntoView({block:'center'});
+                                try { c.click(); } catch(e) { c.dispatchEvent(new MouseEvent('click',{bubbles:true})); }
+                                return true;
+                            }
+                        } catch(e){}
+                    }
+                    return false;
+                """, day_number)
+                if DEBUG: print("Sidebar visible-day click returned:", bool(clicked))
+                time.sleep(AFTER_DATE_CLICK_PAUSE)
+                panel = try_wait_panel(timeout=PANEL_READY_TIMEOUT)
+            except Exception as e:
+                if DEBUG: print("sidebar fallback raised:", repr(e))
+                panel = None
+
+        # Final diagnostic dump and error if still not found
+        if not panel:
+            try:
+                data_dates = driver.execute_script("""
+                    const wrap = document.querySelector('#calendarSidebar') || document.querySelector('.calendarSidebar');
+                    if (!wrap) return [];
+                    const nodes = Array.from(wrap.querySelectorAll('[data-date]'));
+                    const out = [];
+                    for (const n of nodes) {
+                      try { out.push(n.getAttribute('data-date')); } catch(e) {}
+                    }
+                    return out;
+                """)
+            except Exception:
+                data_dates = None
+            try:
+                last_clicked_marker = driver.execute_script("return (window.__slcm_last_clicked_date || null);")
+            except Exception:
+                last_clicked_marker = None
+
+            if DEBUG:
+                print("❗ Diagnostic info: calendarSidebar [data-date] attrs:", data_dates)
+                print("❗ Diagnostic info: window.__slcm_last_clicked_date =", repr(last_clicked_marker))
+                print("❗ Diagnostic info: visible mini-calendar label:", repr(_sidebar_month_label(driver)))
+
+            raise RuntimeError(
+                "❌ Could not locate the correct day panel for the selected date after multiple fallbacks.\n"
+                f"Diagnostic: data-dates-in-sidebar={data_dates}, last_clicked={last_clicked_marker}, last_label={_sidebar_month_label(driver)}"
+            )
+
         if not wait_for_events_to_settle(driver, panel, timeout=EVENT_SETTLE_TIMEOUT):
             print("⚠️ Event list still changing; proceeding with search anyway.")
 
-        # === gradual scroll + polling for the exact tile (up to EVENT_SEARCH_TIMEOUT)
+        # find event tile and open it
         target = scroll_day_panel_gradual(
             driver, panel, max_seconds=EVENT_SEARCH_TIMEOUT,
             code=course_code, sem=semester, sec=class_section,
@@ -573,16 +1317,15 @@ def main():
         if not target:
             raise RuntimeError("❌ Could not locate the event tile for the selected date (after scrolling & waiting).")
 
-        # Click target
         try:
             driver.execute_script("arguments[0].scrollIntoView({block:'center'});", target)
-            time.sleep(0.15)
+            time.sleep(0.12)
             target.click()
             print("✅ Opened the event tile")
         except Exception as e:
             raise RuntimeError(f"❌ Failed to click the event tile: {e}")
 
-        # Popover "More Details" (if shown)
+        # "More Details" if present
         try:
             more_details = WebDriverWait(driver, 8).until(
                 EC.element_to_be_clickable((By.XPATH, "//a[normalize-space()='More Details']"))
@@ -623,7 +1366,7 @@ def main():
             input()
 
         # =============================
-        # Process absentees (UNTICK boxes) — bounded time per student
+        # Process absentees (UNTICK boxes)
         # =============================
         print(f"🔎 Processing attendance for {len(absentees)} absentees…")
         unticked_ids, not_found = [], []
